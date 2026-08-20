@@ -444,6 +444,13 @@ canvas.addEventListener('click', e => {
   }
 });
 let menuZones = [];
+canvas.addEventListener('mousemove', e => {          // pointer over clickables
+  if (state.screen !== 'menu') { canvas.style.cursor = 'default'; return; }
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * (W / r.width), y = (e.clientY - r.top) * (H / r.height);
+  canvas.style.cursor = menuZones.some(z => x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
+    ? 'pointer' : 'default';
+});
 
 /* ============================== PHYSICS ================================ */
 function tankBlocked(maze, x, y) {                   // corners of TANK_BOX
@@ -862,8 +869,20 @@ function drawMenu() {
   ctx.fillText('TANK COMBAT', W / 2, 46);
   ctx.fillStyle = ink; ctx.font = '12px monospace';
   ctx.fillText('the fourteen tank games of 1977, rebuilt', W / 2, 76);
-  ctx.fillStyle = '#ff2d94';                         // hot pink, all palettes
-  ctx.fillText('June Eastham · junexeastham@gmail.com', W / 2, 94);
+  // Credit line: hot pink in every palette; the email is a live mailto
+  // link (canvas has no real anchors, so it's a click zone + underline).
+  ctx.fillStyle = '#ff2d94';
+  const creditName = 'June Eastham · ', creditMail = 'junexeastham@gmail.com';
+  const creditX = W / 2 - ctx.measureText(creditName + creditMail).width / 2;
+  ctx.textAlign = 'left';
+  ctx.fillText(creditName, creditX, 94);
+  const mailX = creditX + ctx.measureText(creditName).width;
+  const mailW = ctx.measureText(creditMail).width;
+  ctx.fillText(creditMail, mailX, 94);
+  ctx.fillRect(mailX, 100, mailW, 1);                // underline = "I'm a link"
+  menuZones.push({x: mailX, y: 84, w: mailW, h: 20,
+    act: () => { location.href = 'mailto:junexeastham@gmail.com'; }});
+  ctx.textAlign = 'center';
 
   ctx.font = '13px monospace';
   for (let i = 0; i < 14; i++) {
