@@ -3,7 +3,7 @@
 A single-file browser remake of games 1–14 of Atari's **Combat** (1977, CX2601) —
 the tank family: Tank, Tank-Pong, Invisible Tank, and Invisible Tank-Pong.
 
-**▶ Play it here: https://potncoffee.github.io/tank-combat/**
+👾** ▶ Play it here: https://potncoffee.github.io/tank-combat/** 👾
 
 No installs, no dependencies, no build step. One HTML file.
 
