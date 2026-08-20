@@ -40,16 +40,22 @@ appear only when firing, when hit, or when bumping a wall.
 - **Space** — fire; in guided-missile games, left/right steer the shell in flight
 - **Esc** — back to menu
 
-Solo against an AI tank, difficulty 1–5. Rounds last 2:16, most hits wins,
-just like 1977.
+**Two-player** (set OPPONENT to 2 PLAYER on the menu, one keyboard):
+
+- **Player 1** — WASD to drive, **Space** to fire
+- **Player 2** — Arrows to drive, **Enter** to fire
+
+Solo against an AI tank (difficulty 1–5) or couch versus, as in 1977.
+Rounds last 2:16, most hits wins.
 
 ## Faithful vs. modernized
 
 Faithful: the game matrix, 16 tank headings, rotate-in-place, guided missile
 steering, billiard scoring rules, invisibility flashes, spin-out on hit, the
-2:16 clock. Modernized: the AI opponent, SNES-grade pixel-art sprites, six
-selectable palettes (two neon), reverse gear, and anti-farming rules (post-hit
-grace period, deadlock-free tank collisions, AI stand-off range).
+2:16 clock, couch two-player. Modernized: the AI opponent, SNES-grade
+pixel-art sprites, six selectable palettes (two neon), reverse gear, and
+anti-farming rules (post-hit grace period, deadlock-free tank collisions,
+AI stand-off range).
 
 ## Tinkering
 
