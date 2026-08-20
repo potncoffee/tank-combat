@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tank Combat</title>
+<!--
+  TANK COMBAT - a remake of games 1-14 of Atari's Combat (1977, CX2601)
+  Built 2026-08-19 for June. MIT licensed.
+
+  Faithful rules, sourced from the original 1977 manual (C011402-01):
+    - Games 1-14 matrix reproduced exactly (see MODES table below).
+    - Left/right rotates the tank in place; forward drives. The original
+      had no reverse ("the back positions have no effect on your tank");
+      reverse was added at June's request in v2, at 70% forward speed.
+    - Guided missiles steer with left/right while in flight.
+    - Tank-Pong: missiles bounce off walls. "Billiard Hit" games require
+      at least one bounce to score; your own ricochet can hit you but
+      never scores against you.
+    - Invisible tanks become visible when firing, when hit, or when
+      bumping a wall or barrier. Both tanks, including yours.
+    - Rounds last 2:16. Hit tank spins out; action freezes briefly.
+    - 16 discrete tank headings, as in the original ROM.
+
+  Modernizations: solo vs. AI (difficulty 1-5), SNES-grade pixel-art
+  sprites, selectable coordinated palettes, WASD or Arrows, reverse gear,
+  and anti-farming rules (v3): a 3s post-hit grace period during which the
+  blinking tank is untouchable and can drive through its attacker; tank
+  collisions only block moves that close distance (touching tanks can
+  always separate); and the AI holds a stand-off range instead of pinning
+  the player against walls.
+
+  HOW TO RESTYLE THE MAZE WALLS LATER:
+    All wall drawing goes through one entry point, drawWalls(), which
+    dispatches to a named renderer in the WALL_STYLES registry. To add
+    a new look, add a function to WALL_STYLES and reference its name
+    from a palette's wall.style field. Game logic never touches wall
+    visuals; it only reads the collision grid.
+
+  HOW TO ADD A PALETTE:
+    Append an object to PALETTES. tankP/tankE are 5-shade arrays:
+    [outline, dark, base, highlight, panel]. Sprites recolor
+    automatically (palette-index swap, the authentic 16-bit method).
+-->
+<style>
+  html, body { margin:0; height:100%; background:#0b0c10; overflow:hidden; }
+  body { display:flex; align-items:center; justify-content:center; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="540"></canvas>
+<script>
+'use strict';
+
+/* ============================== CONSTANTS ============================== */
+
+const W = 800, H = 540, HUD_H = 60;
+const CELL = 20, COLS = 40, ROWS = 24;           // playfield grid (800x480)
+const ROUND_TIME = 136;                           // 2:16, per the manual
+const TANK_SPEED = 105;                           // px/s (~7.5s to cross)
+const HEADINGS = 16;                              // original ROM: 16 headings
+const TURN_INTERVAL = 0.115;                      // s per heading step held
+const TANK_BOX = 32;                              // collision square
+const TANK_DRAW = 44;                             // sprite render size
+const MISSILE_SPEED = 300;
+const MISSILE_LIFE_STRAIGHT = 1.30;               // range limit, as original
+const MISSILE_LIFE_PONG = 1.80;                   // bounces need travel time
+const GUIDED_TURN = 3.4;                          // rad/s steer authority
+const SPIN_TIME = 1.05;                           // hit spin-out freeze
+const GRACE_TIME = 3.0;                           // untouchable window after spin
+const AI_STANDOFF = 95;                           // AI stops advancing this close
+const VIS_FIRE = 0.75, VIS_BUMP = 0.45;           // invisibility flash timers
+const FIRE_COOLDOWN = 0.25;
+
+/* ==================== GAME MODES (1977 manual, exact) =================== */
+// pong: missiles bounce off walls. billiardOnly: must bounce >=1 to score.
+const MODES = [
+  {n:1,  fam:'TANK',                field:'open',    guided:true,  pong:false, billiardOnly:false, invisible:false, desc:'Open field / guided missiles'},
+  {n:2,  fam:'TANK',                field:'easy',    guided:true,  pong:false, billiardOnly:false, invisible:false, desc:'Easy maze / guided missiles'},
+  {n:3,  fam:'TANK',                field:'easy',    guided:false, pong:false, billiardOnly:false, invisible:false, desc:'Easy maze / straight missiles'},
+  {n:4,  fam:'TANK',                field:'complex', guided:true,  pong:false, billiardOnly:false, invisible:false, desc:'Complex maze / guided missiles'},
+  {n:5,  fam:'TANK',                field:'complex', guided:false, pong:false, billiardOnly:false, invisible:false, desc:'Complex maze / straight missiles'},
+  {n:6,  fam:'TANK-PONG',           field:'easy',    guided:false, pong:true,  billiardOnly:false, invisible:false, desc:'Easy maze / direct or billiard hit'},
+  {n:7,  fam:'TANK-PONG',           field:'complex', guided:false, pong:true,  billiardOnly:false, invisible:false, desc:'Complex maze / direct or billiard'},
+  {n:8,  fam:'TANK-PONG',           field:'open',    guided:false, pong:true,  billiardOnly:true,  invisible:false, desc:'Open field / billiard hit only'},
+  {n:9,  fam:'TANK-PONG',           field:'easy',    guided:false, pong:true,  billiardOnly:true,  invisible:false, desc:'Easy maze / billiard hit only'},
+  {n:10, fam:'INVISIBLE TANK',      field:'open',    guided:true,  pong:false, billiardOnly:false, invisible:true,  desc:'Open field / guided missiles'},
+  {n:11, fam:'INVISIBLE TANK',      field:'easy',    guided:true,  pong:false, billiardOnly:false, invisible:true,  desc:'Easy maze / guided missiles'},
+  {n:12, fam:'INVISIBLE TANK-PONG', field:'easy',    guided:false, pong:true,  billiardOnly:false, invisible:true,  desc:'Easy maze / direct or billiard'},
+  {n:13, fam:'INVISIBLE TANK-PONG', field:'open',    guided:false, pong:true,  billiardOnly:true,  invisible:true,  desc:'Open field / billiard hit only'},
+  {n:14, fam:'INVISIBLE TANK-PONG', field:'easy',    guided:false, pong:true,  billiardOnly:true,  invisible:true,  desc:'Easy maze / billiard hit only'},
+];
+
+/* ========================= AI DIFFICULTY (1-5) ========================= */
+const DIFF = {
+  1: {aimTol:14, reactMs:900, speed:0.75, fireCd:2.2, guidedSkill:0.15, noise:90, playerRange:1.00},
+  2: {aimTol:11, reactMs:700, speed:0.85, fireCd:1.8, guidedSkill:0.30, noise:60, playerRange:1.00},
+  3: {aimTol: 8, reactMs:500, speed:0.95, fireCd:1.4, guidedSkill:0.50, noise:35, playerRange:1.00},
+  4: {aimTol: 5, reactMs:350, speed:1.00, fireCd:1.0, guidedSkill:0.70, noise:18, playerRange:0.92},
+  5: {aimTol: 3, reactMs:200, speed:1.05, fireCd:0.7, guidedSkill:0.90, noise: 8, playerRange:0.85},
+};
+
+/* ============================== PALETTES =============================== */
+// Each palette is a complete coordinated set. tankP/tankE shades:
+// [outline, dark, base, highlight, panel]. wall.style names a WALL_STYLES key.
+const PALETTES = [
+  { name:'Neon Grid', page:'#0b0c10',
+    field:'#171922', pattern:'dots', patternColor:'#20232f',
+    wall:{color:'#8f4bff', glow:'#c9a4ff', style:'glow'},
+    tankP:['#0a0a0f','#a3125e','#ff2d94','#ff9ad1','#d81f7c'],
+    tankE:['#0a0a0f','#0b7d8a','#12e6ff','#aef7ff','#0fb9d4'],
+    ui:'#e8e6f0', accent:'#ff2d94', missileP:'#ff9ad1', missileE:'#aef7ff' },
+  { name:'Toxic Night', page:'#0a0d09',
+    field:'#141a12', pattern:'scan', patternColor:'#1a2217',
+    wall:{color:'#1fd6a0', glow:'#8dffd9', style:'glow'},
+    tankP:['#0b0f08','#7fa30e','#c8ff1f','#eaff9a','#a4d216'],
+    tankE:['#0f0a06','#a34d10','#ff7a1f','#ffc394','#d2620f'],
+    ui:'#dff2df', accent:'#c8ff1f', missileP:'#eaff9a', missileE:'#ffc394' },
+  { name:"Classic '77", page:'#1a1408',
+    field:'#c7a04a', pattern:'none', patternColor:'#c7a04a',
+    wall:{color:'#8a4b1f', glow:null, style:'flat'},
+    tankP:['#2e3313','#4c5623','#7c8a3a','#aab86a','#677430'],
+    tankE:['#3d1c0c','#7a3418','#b0512a','#d98b60','#96401f'],
+    ui:'#e6d8b8', accent:'#c7a04a', missileP:'#3a3f1a', missileE:'#4a2313' },
+  { name:'Desert Storm', page:'#171310',
+    field:'#b3a179', pattern:'dots', patternColor:'#a89771',
+    wall:{color:'#7d6b4e', glow:null, style:'bevel'},
+    tankP:['#23291a','#41522c','#5f6e3f','#8fa268','#4f6034'],
+    tankE:['#2b1a10','#5e3520','#8a4a2f','#bd7f5d','#743d25'],
+    ui:'#d9cfc0', accent:'#8fa268', missileP:'#2c3320', missileE:'#3a2114' },
+  { name:'Night Ops', page:'#080b10',
+    field:'#151c26', pattern:'scan', patternColor:'#1a2330',
+    wall:{color:'#33415a', glow:null, style:'bevel'},
+    tankP:['#0a0e14','#2f4f70','#4f7fae','#8fb8dd','#3d658d'],
+    tankE:['#140a0c','#6d3037','#a34f57','#cf8f95','#84424a'],
+    ui:'#c9d6e8', accent:'#4f7fae', missileP:'#8fb8dd', missileE:'#cf8f95' },
+  { name:'Arctic', page:'#dfe7ec',
+    field:'#c9d4da', pattern:'dots', patternColor:'#bcc8cf',
+    wall:{color:'#7f95a3', glow:null, style:'bevel'},
+    tankP:['#33110d','#8f2820','#d03a2f','#ef8d84','#a92e26'],
+    tankE:['#0d1533','#20388f','#2f52d0','#84a0ef','#2642a9'],
+    ui:'#2b3a44', accent:'#d03a2f', missileP:'#8f2820', missileE:'#20388f' },
+];
+
+/* ============================ WALL STYLES ============================== */
+// The theme layer June asked for. Game logic never draws walls directly;
+// it calls drawWalls(ctx, rects, theme). Add new looks here.
+const WALL_STYLES = {
+  flat(ctx, rects, wall) {
+    ctx.fillStyle = wall.color;
+    for (const r of rects) ctx.fillRect(r.x, r.y, r.w, r.h);
+  },
+  bevel(ctx, rects, wall) {
+    const light = shade(wall.color, 1.35), dark = shade(wall.color, 0.6);
+    for (const r of rects) {
+      ctx.fillStyle = wall.color;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.fillStyle = light;                       // lit top and left edges
+      ctx.fillRect(r.x, r.y, r.w, 3);
+      ctx.fillRect(r.x, r.y, 3, r.h);
+      ctx.fillStyle = dark;                        // shadowed bottom and right
+      ctx.fillRect(r.x, r.y + r.h - 3, r.w, 3);
+      ctx.fillRect(r.x + r.w - 3, r.y, 3, r.h);
+    }
+  },
+  glow(ctx, rects, wall) {
+    const core = shade(wall.color, 0.35);
+    for (const r of rects) { ctx.fillStyle = core; ctx.fillRect(r.x, r.y, r.w, r.h); }
+    ctx.save();
+    ctx.shadowColor = wall.glow || wall.color;
+    ctx.shadowBlur = 12;
+    ctx.strokeStyle = wall.color;
+    ctx.lineWidth = 3;
+    for (const r of rects) ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
+    ctx.strokeStyle = wall.glow || wall.color;
+    ctx.lineWidth = 1;
+    for (const r of rects) ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
+    ctx.restore();
+  },
+};
+
+function drawWalls(ctx, rects, wall) {
+  (WALL_STYLES[wall.style] || WALL_STYLES.flat)(ctx, rects, wall);
+}
+
+function shade(hex, f) {                           // lighten (>1) / darken (<1)
+  const n = parseInt(hex.slice(1), 16);
+  const c = v => Math.max(0, Math.min(255, Math.round(v * f)));
+  return `rgb(${c(n >> 16 & 255)},${c(n >> 8 & 255)},${c(n & 255)})`;
+}
+
+/* =============================== MAZES ================================= */
+// Layouts inspired by the manual's Figs G (open), H (easy), I (complex).
+function buildMaze(kind) {
+  const g = new Uint8Array(COLS * ROWS);
+  const rect = (c0, r0, c1, r1) => {
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) g[r * COLS + c] = 1;
+  };
+  rect(0, 0, COLS - 1, 0); rect(0, ROWS - 1, COLS - 1, ROWS - 1);   // border
+  rect(0, 0, 0, ROWS - 1); rect(COLS - 1, 0, COLS - 1, ROWS - 1);
+  if (kind === 'easy') {
+    rect(19, 3, 20, 9);   rect(19, 14, 20, 20);    // center wall, middle gap
+    rect(9, 8, 10, 15);   rect(29, 8, 30, 15);     // flanking walls
+  } else if (kind === 'complex') {
+    rect(19, 6, 20, 17);                            // center cross
+    rect(15, 11, 24, 12);
+    rect(5, 4, 12, 4);   rect(5, 4, 5, 9);           // four corner Ls
+    rect(27, 4, 34, 4);  rect(34, 4, 34, 9);         // (rows 1-3 / 20-22 stay
+    rect(5, 19, 12, 19); rect(5, 14, 5, 19);         //  open: 60px corridors,
+    rect(27, 19, 34, 19); rect(34, 14, 34, 19);      //  a 32px tank fits easy)
+  }
+  // Merge cells into rects for rendering (rows of runs, then vertical merge).
+  const runs = [];
+  for (let r = 0; r < ROWS; r++) {
+    let c = 0;
+    while (c < COLS) {
+      if (g[r * COLS + c]) {
+        let c1 = c;
+        while (c1 + 1 < COLS && g[r * COLS + c1 + 1]) c1++;
+        runs.push({r, c0: c, c1, merged: false});
+        c = c1 + 1;
+      } else c++;
+    }
+  }
+  const rects = [];
+  for (const run of runs) {
+    if (run.merged) continue;
+    let r1 = run.r;
+    for (let rr = run.r + 1; rr < ROWS; rr++) {
+      const next = runs.find(q => !q.merged && q.r === rr && q.c0 === run.c0 && q.c1 === run.c1);
+      if (!next) break;
+      next.merged = true; r1 = rr;
+    }
+    rects.push({x: run.c0 * CELL, y: HUD_H + run.r * CELL,
+                w: (run.c1 - run.c0 + 1) * CELL, h: (r1 - run.r + 1) * CELL});
+  }
+  return {grid: g, rects};
+}
+const solidAt = (maze, x, y) => {                  // x,y in field pixels
+  const c = Math.floor(x / CELL), r = Math.floor((y - HUD_H) / CELL);
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return true;
+  return !!maze.grid[r * COLS + c];
+};
+
+/* ======================= SNES-GRADE TANK SPRITES ======================= */
+// 16x16 index map built procedurally (facing up), two tread frames.
+// Indices: 0 clear, 1 outline, 2 dark, 3 base, 4 highlight, 5 panel.
+function tankMap(frame) {
+  const m = Array.from({length: 16}, () => new Array(16).fill(0));
+  for (const off of [1, 12]) {                      // treads, cols 1-3 / 12-14
+    for (let r = 4; r <= 15; r++) for (let c = off; c <= off + 2; c++) {
+      if (r === 4 || r === 15 || c === off || c === off + 2) m[r][c] = 1;
+      else m[r][c] = ((r + frame) % 3 === 0) ? 3 : 2;   // rolling notches
+    }
+  }
+  for (let r = 5; r <= 14; r++) for (let c = 4; c <= 11; c++) {  // hull
+    if (r === 5 || r === 14 || c === 4 || c === 11) m[r][c] = 1;
+    else if (r === 6 || c === 5) m[r][c] = 4;       // lit top-left
+    else if (r === 13 || c === 10) m[r][c] = 2;     // shadowed bottom-right
+    else m[r][c] = 3;
+  }
+  for (let r = 8; r <= 12; r++) for (let c = 5; c <= 10; c++) {  // turret
+    if (r === 8 && c >= 6 && c <= 9) m[r][c] = 4;
+    else if (r === 12) m[r][c] = 2;
+    else m[r][c] = 5;
+  }
+  for (let r = 0; r <= 8; r++) { m[r][7] = 4; m[r][8] = 2; }     // barrel
+  m[0][7] = 1; m[0][8] = 1;                                       // muzzle tip
+  return m;
+}
+function renderTankSprite(shades, frame) {
+  const S = 3, cv = document.createElement('canvas');
+  cv.width = 16 * S; cv.height = 16 * S;
+  const c2 = cv.getContext('2d');
+  const m = tankMap(frame);
+  for (let r = 0; r < 16; r++) for (let c = 0; c < 16; c++) {
+    if (!m[r][c]) continue;
+    c2.fillStyle = shades[m[r][c] - 1];
+    c2.fillRect(c * S, r * S, S, S);
+  }
+  return cv;
+}
+
+/* ============================== AUDIO ================================== */
+let AC = null;
+function audio() { if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)(); return AC; }
+function blip(freq, dur, type, vol) {
+  try {
+    const a = audio(), o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g).connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur);
+  } catch (e) {}
+}
+function noiseBurst(dur, vol, lowpass) {
+  try {
+    const a = audio(), n = Math.floor(a.sampleRate * dur);
+    const buf = a.createBuffer(1, n, a.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lowpass;
+    const g = a.createGain(); g.gain.value = vol;
+    src.connect(f).connect(g).connect(a.destination); src.start();
+  } catch (e) {}
+}
+const sfxFire = () => { blip(220, 0.12, 'square', 0.12); noiseBurst(0.10, 0.10, 2400); };
+const sfxBounce = () => blip(600, 0.05, 'square', 0.08);
+const sfxExplode = () => { noiseBurst(0.5, 0.30, 900); blip(70, 0.5, 'sawtooth', 0.12); };
+let engineOsc = null, engineGain = null;
+function engineSound(on, moving) {
+  try {
+    const a = audio();
+    if (!engineOsc) {
+      engineOsc = a.createOscillator(); engineGain = a.createGain();
+      engineOsc.type = 'square'; engineOsc.frequency.value = 42;
+      engineGain.gain.value = 0;
+      engineOsc.connect(engineGain).connect(a.destination);
+      engineOsc.start();
+    }
+    engineGain.gain.linearRampToValueAtTime(on ? (moving ? 0.035 : 0.018) : 0, a.currentTime + 0.08);
+    engineOsc.frequency.linearRampToValueAtTime(moving ? 66 : 42, a.currentTime + 0.1);
+  } catch (e) {}
+}
+
+/* ============================ GAME STATE =============================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const settings = {
+  mode: 0,                                          // index into MODES
+  palette: 0,
+  difficulty: 3,
+  controls: 'arrows',                               // 'arrows' | 'wasd'
+};
+try { Object.assign(settings, JSON.parse(localStorage.getItem('combat14') || '{}')); } catch (e) {}
+function saveSettings() { try { localStorage.setItem('combat14', JSON.stringify(settings)); } catch (e) {} }
+
+const state = {
+  screen: 'menu',                                   // menu | play | end
+  menuFocus: 0,                                     // 0-13 games, 14-16 settings
+  maze: null, mode: null, pal: null, diff: null,
+  timeLeft: ROUND_TIME,
+  tanks: [], missiles: [], particles: [], flashes: [],
+  freeze: 0, spinner: null, shake: 0,
+  sprites: null,                                    // prerendered per palette
+  winner: null,
+};
+
+function makeTank(x, y, headingIdx, isPlayer) {
+  return {x, y, h: headingIdx, isPlayer, score: 0,
+          turnAcc: 0, fireCd: 0, visible: 0, bumped: false, moving: false,
+          spin: 0, spinDir: 1, grace: 0,
+          ai: {think: 0, tx: x, ty: y, avoidT: 0, avoidH: 0}};
+}
+const hRad = idx => idx * (Math.PI * 2 / HEADINGS) - Math.PI / 2;   // 0 = up
+
+function startGame() {
+  const mode = MODES[settings.mode];
+  state.mode = mode;
+  state.pal = PALETTES[settings.palette];
+  state.diff = DIFF[settings.difficulty];
+  state.maze = buildMaze(mode.field);
+  state.timeLeft = ROUND_TIME;
+  state.missiles = []; state.particles = []; state.flashes = [];
+  state.freeze = 0; state.spinner = null; state.shake = 0; state.winner = null;
+  const midY = HUD_H + (ROWS / 2) * CELL;
+  state.tanks = [
+    makeTank(3 * CELL, midY, 4, true),              // heading 4 = east
+    makeTank((COLS - 3) * CELL, midY, 12, false),   // heading 12 = west
+  ];
+  state.sprites = {
+    P: [renderTankSprite(state.pal.tankP, 0), renderTankSprite(state.pal.tankP, 1)],
+    E: [renderTankSprite(state.pal.tankE, 0), renderTankSprite(state.pal.tankE, 1)],
+  };
+  state.screen = 'play';
+}
+
+/* ============================== INPUT ================================== */
+const keys = {};
+const KEYSETS = {
+  arrows: {left:'ArrowLeft', right:'ArrowRight', fwd:'ArrowUp', back:'ArrowDown', fire:' '},
+  wasd:   {left:'a', right:'d', fwd:'w', back:'s', fire:' '},
+};
+addEventListener('keydown', e => {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+  if (!keys[k]) keys[k] = true, keyPressed(k);
+});
+addEventListener('keyup', e => {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  keys[k] = false;
+});
+
+function keyPressed(k) {
+  try { audio().resume(); } catch (e) {}             // unlock on first input
+  if (state.screen === 'menu') return menuKey(k);
+  if (state.screen === 'end') {
+    if (k === 'Enter') { state.screen = 'menu'; engineSound(false, false); }
+    if (k === 'r') startGame();
+    return;
+  }
+  if (k === 'Escape') { state.screen = 'menu'; engineSound(false, false); }
+}
+
+function menuKey(k) {
+  const f = state.menuFocus;
+  if (k === 'ArrowDown' || k === 's') state.menuFocus = Math.min(16, f + 1);
+  else if (k === 'ArrowUp' || k === 'w') state.menuFocus = Math.max(0, f - 1);
+  else if (k === 'ArrowLeft' || k === 'a' || k === 'ArrowRight' || k === 'd') {
+    const dir = (k === 'ArrowLeft' || k === 'a') ? -1 : 1;
+    if (f < 14) state.menuFocus = Math.max(0, Math.min(13, f + dir * 7)); // hop columns
+    else if (f === 14) settings.palette = (settings.palette + dir + PALETTES.length) % PALETTES.length;
+    else if (f === 15) settings.difficulty = Math.max(1, Math.min(5, settings.difficulty + dir));
+    else if (f === 16) settings.controls = settings.controls === 'arrows' ? 'wasd' : 'arrows';
+    saveSettings();
+  }
+  else if (k === 'Enter' || k === ' ') {
+    if (f < 14) settings.mode = f;
+    saveSettings();
+    startGame();
+  }
+}
+
+canvas.addEventListener('click', e => {
+  try { audio().resume(); } catch (e2) {}
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * (W / r.width), y = (e.clientY - r.top) * (H / r.height);
+  if (state.screen !== 'menu') return;
+  for (const z of menuZones) {
+    if (x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h) { z.act(); saveSettings(); break; }
+  }
+});
+let menuZones = [];
+
+/* ============================== PHYSICS ================================ */
+function tankBlocked(maze, x, y) {                   // corners of TANK_BOX
+  const s = TANK_BOX / 2 - 1;
+  return solidAt(maze, x - s, y - s) || solidAt(maze, x + s, y - s) ||
+         solidAt(maze, x - s, y + s) || solidAt(maze, x + s, y + s);
+}
+function tanksOverlap(t, x, y, b) {
+  // Anti-pinning rules: a blinking (grace) tank ghosts through the other,
+  // and a move that increases separation is always allowed, so two touching
+  // tanks can always peel apart. Only approaches into overlap are blocked.
+  if (t.grace > 0 || b.grace > 0) return false;
+  const cur = Math.max(Math.abs(t.x - b.x), Math.abs(t.y - b.y));
+  const nxt = Math.max(Math.abs(x - b.x), Math.abs(y - b.y));
+  return nxt < TANK_BOX && nxt <= cur;
+}
+
+function moveTank(t, other, dt, dir = 1) {           // dir -1 = reverse (70%)
+  const rad = hRad(t.h);
+  const spd = TANK_SPEED * (t.isPlayer ? 1 : state.diff.speed) * (dir < 0 ? 0.7 : 1) * dir;
+  const nx = t.x + Math.cos(rad) * spd * dt;
+  const ny = t.y + Math.sin(rad) * spd * dt;
+  t.bumped = false;
+  if (!tankBlocked(state.maze, nx, ny) && !tanksOverlap(t, nx, ny, other)) {
+    t.x = nx; t.y = ny; t.moving = true;
+  } else {
+    t.bumped = true; t.moving = false;
+    if (state.mode.invisible) t.visible = Math.max(t.visible, VIS_BUMP);
+  }
+}
+
+function fireMissile(t) {
+  if (t.fireCd > 0 || state.missiles.some(m => m.owner === t)) return;
+  const rad = hRad(t.h);
+  const life = (state.mode.pong ? MISSILE_LIFE_PONG : MISSILE_LIFE_STRAIGHT) *
+               (t.isPlayer ? state.diff.playerRange : 1);
+  state.missiles.push({
+    owner: t, x: t.x + Math.cos(rad) * 26, y: t.y + Math.sin(rad) * 26,
+    ang: rad, life, bounces: 0,
+    trail: [],
+  });
+  state.flashes.push({x: t.x + Math.cos(rad) * 28, y: t.y + Math.sin(rad) * 28, t: 0.12});
+  if (state.mode.invisible) t.visible = Math.max(t.visible, VIS_FIRE);
+  sfxFire();
+}
+
+function updateMissiles(dt) {
+  const ks = KEYSETS[settings.controls];
+  for (let i = state.missiles.length - 1; i >= 0; i--) {
+    const m = state.missiles[i];
+    // Guided steering: player uses left/right keys; AI steers by skill.
+    if (state.mode.guided) {
+      if (m.owner.isPlayer) {
+        if (keys[ks.left])  m.ang -= GUIDED_TURN * dt;
+        if (keys[ks.right]) m.ang += GUIDED_TURN * dt;
+      } else {
+        const p = state.tanks[0];
+        const want = Math.atan2(p.y - m.y, p.x - m.x);
+        let d = want - m.ang;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d < -Math.PI) d += 2 * Math.PI;
+        m.ang += Math.max(-1, Math.min(1, d)) * GUIDED_TURN * state.diff.guidedSkill * dt;
+      }
+    }
+    m.trail.push({x: m.x, y: m.y});
+    if (m.trail.length > 7) m.trail.shift();
+    let nx = m.x + Math.cos(m.ang) * MISSILE_SPEED * dt;
+    let ny = m.y + Math.sin(m.ang) * MISSILE_SPEED * dt;
+    if (solidAt(state.maze, nx, ny)) {
+      if (state.mode.pong) {                        // reflect off the wall
+        const hitV = solidAt(state.maze, nx, m.y);  // vertical face?
+        const hitH = solidAt(state.maze, m.x, ny);  // horizontal face?
+        if (hitV) m.ang = Math.PI - m.ang;
+        if (hitH) m.ang = -m.ang;
+        if (!hitV && !hitH) m.ang += Math.PI;       // corner: reverse
+        m.bounces++;
+        sfxBounce();
+        nx = m.x; ny = m.y;
+      } else {
+        state.missiles.splice(i, 1);
+        m.owner.fireCd = FIRE_COOLDOWN;
+        puff(nx, ny, 5);
+        continue;
+      }
+    }
+    m.x = nx; m.y = ny;
+    m.life -= dt;
+    if (m.life <= 0) { state.missiles.splice(i, 1); m.owner.fireCd = FIRE_COOLDOWN; continue; }
+    // Hit detection against both tanks. A freshly hit tank is untouchable
+    // for a beat (grace), so it can actually retreat instead of being farmed.
+    for (const t of state.tanks) {
+      if (t.grace > 0) continue;
+      const s = TANK_BOX / 2;
+      if (Math.abs(m.x - t.x) > s || Math.abs(m.y - t.y) > s) continue;
+      if (t === m.owner) {
+        if (m.bounces === 0) continue;              // can't hit self pre-bounce
+        state.missiles.splice(i, 1);                // own ricochet: no score
+        t.fireCd = FIRE_COOLDOWN;
+        puff(m.x, m.y, 8);
+        break;
+      }
+      const scores = !state.mode.billiardOnly || m.bounces >= 1;
+      state.missiles.splice(i, 1);
+      m.owner.fireCd = FIRE_COOLDOWN;
+      if (scores) {
+        m.owner.score++;
+        explode(t.x, t.y);
+        t.spin = SPIN_TIME; t.spinDir = Math.random() < 0.5 ? -1 : 1;
+        t.grace = SPIN_TIME + GRACE_TIME;           // retreat window after spin
+        if (state.mode.invisible) t.visible = Math.max(t.visible, SPIN_TIME);
+        state.freeze = SPIN_TIME; state.spinner = t;
+        state.missiles.length = 0;                  // original clears the field
+        state.shake = 0.3;
+        sfxExplode();
+        return;                                     // nothing left to update
+      } else {
+        puff(m.x, m.y, 8);                          // billiard rule: no score
+      }
+      break;
+    }
+  }
+}
+
+/* =============================== AI ==================================== */
+function losClear(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, dist = Math.hypot(dx, dy);
+  const steps = Math.ceil(dist / (CELL / 2));
+  for (let i = 1; i < steps; i++) {
+    if (solidAt(state.maze, a.x + dx * i / steps, a.y + dy * i / steps)) return false;
+  }
+  return true;
+}
+function wallAhead(t, lookPx) {
+  const rad = hRad(t.h);
+  return solidAt(state.maze, t.x + Math.cos(rad) * lookPx, t.y + Math.sin(rad) * lookPx);
+}
+function updateAI(t, dt) {
+  const d = state.diff, p = state.tanks[0];
+  t.ai.think -= dt * 1000;
+  if (t.ai.think <= 0) {
+    t.ai.think = d.reactMs;
+    t.ai.tx = p.x + (Math.random() * 2 - 1) * d.noise;
+    t.ai.ty = p.y + (Math.random() * 2 - 1) * d.noise;
+  }
+  // Wall avoidance: when blocked, commit to sliding along the clearer
+  // perpendicular for a beat instead of dithering against the wall.
+  if (t.ai.avoidT > 0) t.ai.avoidT -= dt;
+  if (wallAhead(t, TANK_BOX) && t.ai.avoidT <= 0) {
+    const probe = idx => {
+      const r = hRad(idx);
+      return !solidAt(state.maze, t.x + Math.cos(r) * TANK_BOX * 1.6,
+                                  t.y + Math.sin(r) * TANK_BOX * 1.6);
+    };
+    const rightIdx = (t.h + 4) % HEADINGS, leftIdx = (t.h + 12) % HEADINGS;
+    const preferRight = Math.random() < 0.5;
+    t.ai.avoidH = probe(preferRight ? rightIdx : leftIdx) ? (preferRight ? rightIdx : leftIdx)
+                : probe(preferRight ? leftIdx : rightIdx) ? (preferRight ? leftIdx : rightIdx)
+                : (t.h + 8) % HEADINGS;              // dead end: turn around
+    t.ai.avoidT = 0.9;
+  }
+  let wantIdx;
+  if (t.ai.avoidT > 0) wantIdx = t.ai.avoidH;
+  else {
+    const want = Math.atan2(t.ai.ty - t.y, t.ai.tx - t.x);
+    wantIdx = ((Math.round((want + Math.PI / 2) / (Math.PI * 2 / HEADINGS)) % HEADINGS) + HEADINGS) % HEADINGS;
+  }
+  let diff = wantIdx - t.h;
+  if (diff > HEADINGS / 2) diff -= HEADINGS;
+  if (diff < -HEADINGS / 2) diff += HEADINGS;
+  t.turnAcc += dt;
+  if (t.turnAcc >= TURN_INTERVAL / d.speed) {
+    t.turnAcc = 0;
+    if (diff !== 0) t.h = ((t.h + Math.sign(diff)) % HEADINGS + HEADINGS) % HEADINGS;
+  }
+  // Stand-off: never grind into the player; hold range and shoot instead.
+  const distToP = Math.hypot(p.x - t.x, p.y - t.y);
+  if (Math.abs(diff) <= 2 && !wallAhead(t, TANK_BOX) &&
+      (distToP > AI_STANDOFF || t.ai.avoidT > 0)) moveTank(t, p, dt);
+  else t.moving = false;
+  // Fire decision.
+  t.fireCd -= dt;
+  const angToP = Math.atan2(p.y - t.y, p.x - t.x);
+  let aimDelta = angToP - hRad(t.h);
+  while (aimDelta > Math.PI) aimDelta -= 2 * Math.PI;
+  while (aimDelta < -Math.PI) aimDelta += 2 * Math.PI;
+  const aimErr = Math.abs(aimDelta) * 180 / Math.PI;
+  const canSee = state.mode.pong || losClear(t, p);
+  if (aimErr < d.aimTol && canSee && t.fireCd <= 0 && !state.missiles.some(m => m.owner === t)) {
+    fireMissile(t);
+    t.fireCd = d.fireCd;
+  }
+  // In pong-billiard modes, take occasional speculative bank shots.
+  if (state.mode.pong && t.fireCd <= 0 && Math.random() < 0.15 * dt * d.speed &&
+      !state.missiles.some(m => m.owner === t)) {
+    fireMissile(t);
+    t.fireCd = d.fireCd;
+  }
+}
+
+/* ============================ PARTICLES ================================ */
+function explode(x, y) {
+  const colors = ['#ffffff', '#ffe08a', '#ffb347', '#ff6b35', '#9a9a9a'];
+  for (let i = 0; i < 30; i++) {
+    const a = Math.random() * Math.PI * 2, v = 40 + Math.random() * 180;
+    state.particles.push({x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+      life: 0.4 + Math.random() * 0.5, max: 0.9,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      size: 2 + Math.floor(Math.random() * 4)});
+  }
+}
+function puff(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = 20 + Math.random() * 60;
+    state.particles.push({x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+      life: 0.25 + Math.random() * 0.2, max: 0.45, color: '#cccccc', size: 2});
+  }
+}
+function updateParticles(dt) {
+  for (let i = state.particles.length - 1; i >= 0; i--) {
+    const p = state.particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.92; p.vy *= 0.92;
+    p.life -= dt;
+    if (p.life <= 0) state.particles.splice(i, 1);
+  }
+  for (let i = state.flashes.length - 1; i >= 0; i--) {
+    state.flashes[i].t -= dt;
+    if (state.flashes[i].t <= 0) state.flashes.splice(i, 1);
+  }
+}
+
+/* ============================== UPDATE ================================= */
+function update(dt) {
+  if (state.screen !== 'play') { engineSound(false, false); return; }
+  state.timeLeft -= dt;
+  state.shake = Math.max(0, state.shake - dt);
+  if (state.timeLeft <= 0) {
+    const [p, e] = state.tanks;
+    state.winner = p.score > e.score ? 'player' : e.score > p.score ? 'enemy' : 'draw';
+    state.screen = 'end';
+    engineSound(false, false);
+    return;
+  }
+  const [p, e] = state.tanks;
+  for (const t of state.tanks) {
+    t.visible = Math.max(0, t.visible - dt);
+    t.grace = Math.max(0, t.grace - dt);
+  }
+
+  if (state.freeze > 0) {                            // hit spin-out: all stop
+    state.freeze -= dt;
+    if (state.spinner) {
+      state.spinner.spin -= dt;
+      if ((state.spinner.turnAcc += dt) > 0.045) {
+        state.spinner.turnAcc = 0;
+        state.spinner.h = ((state.spinner.h + state.spinner.spinDir) % HEADINGS + HEADINGS) % HEADINGS;
+      }
+    }
+    if (state.freeze <= 0) state.spinner = null;
+    updateParticles(dt);
+    return;
+  }
+
+  // Player controls: left/right rotate in place (always), forward drives.
+  const ks = KEYSETS[settings.controls];
+  const myMissile = state.missiles.find(m => m.owner === p);
+  p.turnAcc += dt;
+  p.moving = false;
+  // While a guided missile flies, left/right steer it AND the tank (one
+  // joystick signal in 1977; both respond, as on real hardware).
+  if (p.turnAcc >= TURN_INTERVAL) {
+    if (keys[ks.left])  { p.h = ((p.h - 1) % HEADINGS + HEADINGS) % HEADINGS; p.turnAcc = 0; }
+    else if (keys[ks.right]) { p.h = (p.h + 1) % HEADINGS; p.turnAcc = 0; }
+  }
+  if (keys[ks.fwd]) moveTank(p, e, dt);
+  else if (keys[ks.back]) moveTank(p, e, dt, -1);
+  p.fireCd -= dt;
+  if (keys[ks.fire] && !myMissile) fireMissile(p);
+  engineSound(true, p.moving);
+
+  updateAI(e, dt);
+  updateMissiles(dt);
+  updateParticles(dt);
+}
+
+/* ============================== RENDER ================================= */
+function drawField() {
+  const pal = state.pal;
+  ctx.fillStyle = pal.field;
+  ctx.fillRect(0, HUD_H, W, H - HUD_H);
+  if (pal.pattern === 'dots') {
+    ctx.fillStyle = pal.patternColor;
+    for (let r = 1; r < ROWS; r += 2) for (let c = 1; c < COLS; c += 2)
+      ctx.fillRect(c * CELL + 9, HUD_H + r * CELL + 9, 2, 2);
+  } else if (pal.pattern === 'scan') {
+    ctx.fillStyle = pal.patternColor;
+    for (let y = HUD_H; y < H; y += 4) ctx.fillRect(0, y, W, 1);
+  }
+  drawWalls(ctx, state.maze.rects, pal.wall);
+}
+
+function drawTank(t) {
+  const invisible = state.mode.invisible && t.visible <= 0 && t.spin <= 0;
+  if (invisible) return;
+  const frame = t.moving ? (Math.floor(performance.now() / 90) % 2) : 0;
+  const spr = state.sprites[t.isPlayer ? 'P' : 'E'][frame];
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  ctx.rotate(hRad(t.h) + Math.PI / 2);               // sprite faces up
+  if (state.mode.invisible && t.visible > 0 && t.spin <= 0)
+    ctx.globalAlpha = Math.min(1, t.visible / 0.2);  // fade the flash out
+  if (t.grace > 0 && state.freeze <= 0)              // blink while untouchable
+    ctx.globalAlpha *= (Math.floor(performance.now() / 90) % 2) ? 0.35 : 0.85;
+  ctx.drawImage(spr, -TANK_DRAW / 2, -TANK_DRAW / 2, TANK_DRAW, TANK_DRAW);
+  ctx.restore();
+}
+
+function drawMissiles() {
+  const pal = state.pal;
+  for (const m of state.missiles) {
+    const col = m.owner.isPlayer ? pal.missileP : pal.missileE;
+    // Tracer trail.
+    for (let i = 0; i < m.trail.length; i++) {
+      ctx.globalAlpha = (i / m.trail.length) * 0.35;
+      ctx.fillStyle = col;
+      ctx.fillRect(m.trail[i].x - 1, m.trail[i].y - 1, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+    // Shell: bright core with a dark tip, oriented to flight.
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.rotate(m.ang);
+    ctx.fillStyle = col;
+    ctx.fillRect(-4, -2, 7, 4);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(3, -2, 3, 4);                       // hardened tip
+    ctx.restore();
+  }
+  for (const f of state.flashes) {                   // muzzle flash
+    ctx.fillStyle = '#fff2a8';
+    const r = 3 + (0.12 - f.t) * 40;
+    ctx.fillRect(f.x - r / 2, f.y - r / 2, r, r);
+  }
+}
+
+function drawParticles() {
+  for (const p of state.particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  const pal = state.pal, [p, e] = state.tanks;
+  ctx.fillStyle = pal.page;
+  ctx.fillRect(0, 0, W, HUD_H);
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 34px monospace';
+  ctx.fillStyle = pal.tankP[2]; ctx.textAlign = 'left';
+  ctx.fillText(String(p.score), 30, HUD_H / 2);
+  ctx.fillStyle = pal.tankE[2]; ctx.textAlign = 'right';
+  ctx.fillText(String(e.score), W - 30, HUD_H / 2);
+  const s = Math.max(0, Math.ceil(state.timeLeft));
+  ctx.fillStyle = pal.ui === pal.page ? '#ffffff' : pal.ui;
+  ctx.textAlign = 'center'; ctx.font = 'bold 26px monospace';
+  ctx.fillText(`${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`, W / 2, HUD_H / 2 - 8);
+  ctx.font = '11px monospace';
+  ctx.fillText(`GAME ${state.mode.n} · ${state.mode.fam}`, W / 2, HUD_H - 12);
+}
+
+function drawPlay() {
+  ctx.save();
+  if (state.shake > 0)
+    ctx.translate((Math.random() - 0.5) * state.shake * 16, (Math.random() - 0.5) * state.shake * 16);
+  drawField();
+  for (const t of state.tanks) drawTank(t);
+  drawMissiles();
+  drawParticles();
+  ctx.restore();
+  drawHUD();
+}
+
+function drawEnd() {
+  drawPlay();
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 44px monospace';
+  const msg = state.winner === 'player' ? 'YOU WIN' : state.winner === 'enemy' ? 'ENEMY WINS' : 'DRAW';
+  ctx.fillText('TIME!', W / 2, H / 2 - 70);
+  ctx.fillStyle = state.winner === 'player' ? state.pal.tankP[3] :
+                  state.winner === 'enemy' ? state.pal.tankE[3] : '#cccccc';
+  ctx.fillText(msg, W / 2, H / 2 - 10);
+  ctx.fillStyle = '#bbbbbb'; ctx.font = '18px monospace';
+  const [p, e] = state.tanks;
+  ctx.fillText(`${p.score}  -  ${e.score}`, W / 2, H / 2 + 40);
+  ctx.fillText('R = rematch    ENTER = menu', W / 2, H / 2 + 90);
+}
+
+function drawMenu() {
+  menuZones = [];
+  const pal = PALETTES[settings.palette];
+  ctx.fillStyle = pal.page; ctx.fillRect(0, 0, W, H);
+  const ink = (pal.name === "Classic '77" || pal.name === 'Desert Storm' || pal.name === 'Arctic')
+    ? pal.ui : pal.ui;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = pal.accent; ctx.font = 'bold 42px monospace';
+  ctx.fillText('TANK COMBAT', W / 2, 46);
+  ctx.fillStyle = ink; ctx.font = '12px monospace';
+  ctx.fillText('the fourteen tank games of 1977, rebuilt', W / 2, 76);
+
+  ctx.font = '13px monospace';
+  for (let i = 0; i < 14; i++) {
+    const col = i < 7 ? 0 : 1;
+    const x = 40 + col * 380, y = 108 + (i % 7) * 40;
+    const m = MODES[i];
+    const sel = state.menuFocus === i;
+    const active = settings.mode === i;
+    if (sel) { ctx.fillStyle = pal.accent; ctx.fillRect(x - 10, y - 16, 360, 34); }
+    ctx.textAlign = 'left';
+    ctx.fillStyle = sel ? pal.page : (active ? pal.accent : ink);
+    ctx.font = 'bold 13px monospace';
+    ctx.fillText(`${String(m.n).padStart(2)} ${m.fam}`, x, y - 6);
+    ctx.font = '11px monospace';
+    ctx.globalAlpha = sel ? 1 : 0.75;
+    ctx.fillText(m.desc, x + 24, y + 9);
+    ctx.globalAlpha = 1;
+    menuZones.push({x: x - 10, y: y - 16, w: 360, h: 34,
+      act: () => { settings.mode = i; state.menuFocus = i; startGame(); }});
+  }
+
+  const rows = [
+    {i: 14, label: 'PALETTE', value: pal.name},
+    {i: 15, label: 'DIFFICULTY', value: '■'.repeat(settings.difficulty) + '□'.repeat(5 - settings.difficulty)},
+    {i: 16, label: 'CONTROLS', value: settings.controls === 'arrows' ? 'ARROW KEYS' : 'W A S D'},
+  ];
+  for (let r = 0; r < rows.length; r++) {
+    const y = 412 + r * 34, sel = state.menuFocus === rows[r].i;
+    if (sel) { ctx.fillStyle = pal.accent; ctx.fillRect(180, y - 14, 440, 28); }
+    ctx.textAlign = 'left'; ctx.font = 'bold 13px monospace';
+    ctx.fillStyle = sel ? pal.page : ink;
+    ctx.fillText(rows[r].label, 200, y);
+    ctx.textAlign = 'right';
+    ctx.fillText('◄ ' + rows[r].value + ' ►', 600, y);
+    const idx = rows[r].i;
+    menuZones.push({x: 180, y: y - 14, w: 220, h: 28, act: () => bumpSetting(idx, -1)});
+    menuZones.push({x: 400, y: y - 14, w: 220, h: 28, act: () => bumpSetting(idx, 1)});
+  }
+  ctx.textAlign = 'center'; ctx.fillStyle = ink; ctx.font = '12px monospace';
+  ctx.globalAlpha = 0.8;
+  ctx.fillText('↑↓ select · ←→ adjust · ENTER start · SPACE fires in game · ESC back to menu', W / 2, H - 16);
+  ctx.globalAlpha = 1;
+}
+function bumpSetting(i, dir) {
+  state.menuFocus = i;
+  if (i === 14) settings.palette = (settings.palette + dir + PALETTES.length) % PALETTES.length;
+  else if (i === 15) settings.difficulty = Math.max(1, Math.min(5, settings.difficulty + dir));
+  else if (i === 16) settings.controls = settings.controls === 'arrows' ? 'wasd' : 'arrows';
+}
+
+/* ============================ MAIN LOOP ================================ */
+function fitCanvas() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+}
+addEventListener('resize', fitCanvas);
+fitCanvas();
+
+// QA hook: open the file with #game=N&pal=M&diff=D to jump straight in
+// (e.g. "Combat 14 08.19.26.html#game=10&pal=1"). Also handy for testing.
+if (typeof location !== 'undefined' && location.hash.length > 1) {
+  const q = new URLSearchParams(location.hash.slice(1));
+  if (q.has('game')) {
+    settings.mode = Math.max(1, Math.min(14, +q.get('game') || 1)) - 1;
+    if (q.has('pal')) settings.palette = Math.max(0, Math.min(PALETTES.length - 1, +q.get('pal') || 0));
+    if (q.has('diff')) settings.difficulty = Math.max(1, Math.min(5, +q.get('diff') || 3));
+    startGame();
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  document.body.style.background = (state.screen === 'menu' ? PALETTES[settings.palette] : state.pal || PALETTES[settings.palette]).page;
+  if (state.screen === 'menu') drawMenu();
+  else if (state.screen === 'play') drawPlay();
+  else drawEnd();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
