@@ -862,11 +862,13 @@ function drawMenu() {
   ctx.fillText('TANK COMBAT', W / 2, 46);
   ctx.fillStyle = ink; ctx.font = '12px monospace';
   ctx.fillText('the fourteen tank games of 1977, rebuilt', W / 2, 76);
+  ctx.fillStyle = '#ff2d94';                         // hot pink, all palettes
+  ctx.fillText('June Eastham · junexeastham@gmail.com', W / 2, 94);
 
   ctx.font = '13px monospace';
   for (let i = 0; i < 14; i++) {
     const col = i < 7 ? 0 : 1;
-    const x = 40 + col * 380, y = 108 + (i % 7) * 40;
+    const x = 40 + col * 380, y = 118 + (i % 7) * 40;
     const m = MODES[i];
     const sel = state.menuFocus === i;
     const active = settings.mode === i;
@@ -901,10 +903,8 @@ function drawMenu() {
     menuZones.push({x: 180, y: y - 14, w: 220, h: 28, act: () => bumpSetting(idx, -1)});
     menuZones.push({x: 400, y: y - 14, w: 220, h: 28, act: () => bumpSetting(idx, 1)});
   }
-  ctx.textAlign = 'center'; ctx.fillStyle = ink; ctx.font = '11px monospace';
-  ctx.globalAlpha = 0.7;
-  ctx.fillText('June Eastham · junexeastham@gmail.com', W / 2, H - 34);
-  ctx.globalAlpha = 0.8; ctx.font = '12px monospace';
+  ctx.textAlign = 'center'; ctx.fillStyle = ink; ctx.font = '12px monospace';
+  ctx.globalAlpha = 0.8;
   ctx.fillText('↑↓ select · ←→ adjust · ENTER start · ESC menu · 2P: WASD+SPACE vs ARROWS+ENTER', W / 2, H - 16);
   ctx.globalAlpha = 1;
 }
